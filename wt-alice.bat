@@ -1,0 +1,1 @@
+cls  && python Desktop/plugin/alice_api.py
