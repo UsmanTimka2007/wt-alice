@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Парсер чата Алисы через браузер. Чистая реализация с нуля.
+Парсер чата Алисы через браузер. Чистая реализация с нуля (без JS-вставок).
 """
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+import time  # Для измерения времени
 
 URL = "https://alice.yandex.ru"
 
@@ -14,104 +15,82 @@ BUBBLE_SEL = ".AliceTextBubbleAnimated"
 STABLE_MS = 2000
 POLL_MS = 300
 
-
 def _type_and_send(page, text: str) -> None:
     """Вставляет текст в поле ввода и отправляет."""
-    js = """
-    (text) => {
-        const el = document.querySelector("textarea, [contenteditable='true'], [placeholder*='Спросите']");
-        if (!el) return false;
-        el.focus();
-        if (el.tagName === "TEXTAREA") {
-            el.value = text;
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-        } else {
-            const r = document.createRange();
-            r.selectNodeContents(el);
-            r.collapse(true);
-            const s = window.getSelection();
-            s.removeAllRanges();
-            s.addRange(r);
-            document.execCommand("insertText", false, text);
-        }
-        return true;
-    }
-    """
+    # Прокручиваем вниз
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     page.wait_for_timeout(600)
 
-    if not page.evaluate(js, text):
-        vp = page.viewport_size
-        page.mouse.click(vp["width"] // 2, vp["height"] - 80)
-        page.wait_for_timeout(200)
+    # Ищем поле ввода
+    input_field = page.query_selector(INPUT_SEL)
+    if not input_field:
+        raise Exception("Поле ввода не найдено")
+
+    # Кликаем для фокуса
+    input_field.click()
+    page.wait_for_timeout(200)
+
+    # Определяем тип элемента и вставляем текст
+    tag_name = input_field.evaluate("(el) => el.tagName")
+    if tag_name == "TEXTAREA":
+        # Для <textarea> используем fill()
+        input_field.fill(text)
+    else:
+        # Для contenteditable используем type()
         page.keyboard.type(text, delay=20)
 
     page.wait_for_timeout(100)
+    # Отправляем, нажимая Enter
     page.keyboard.press("Enter")
-
 
 def _wait_response_in_page(page, prev_text: str, timeout_ms: int = 120000) -> str:
     """
-    Вся логика ожидания — в JS на странице.
     Ждёт появления текста в последнем пузыре, отличного от prev_text,
-    и его стабилизации. Возвращает Promise — Playwright дождётся.
+    и его стабилизации.
     """
-    return page.evaluate(
-        """
-    (args) => {
-        const { prevText, timeoutMs, stableMs, pollMs } = args;
-        return new Promise((resolve) => {
-            let lastSeen = "";
-            let stableCount = 0;
-            const stableTicks = Math.ceil(stableMs / pollMs);
+    start_time = time.time()  # Начало отсчёта общего таймаута
+    stable_start_time = None  # Время, когда текст стал стабильным
+    last_seen = ""  # Последний увиденный текст
 
-            const check = () => {
-                const bubbles = document.querySelectorAll(".AliceTextBubbleAnimated");
-                if (!bubbles.length) return;
-                const last = bubbles[bubbles.length - 1];
-                const text = last.innerText.trim();
-                if (!text) return;
-                if (text === prevText) return;
-                if (text === lastSeen) {
-                    stableCount++;
-                    if (stableCount >= stableTicks) {
-                        clearInterval(iv);
-                        clearTimeout(tm);
-                        resolve(text);
-                    }
-                } else {
-                    lastSeen = text;
-                    stableCount = 0;
-                }
-            };
+    while (time.time() - start_time) < timeout_ms / 1000:
+        # Ждём появления хотя бы одного пузыря
+        bubbles = page.query_selector_all(BUBBLE_SEL)
+        if not bubbles:
+            page.wait_for_timeout(POLL_MS)
+            continue
 
-            const iv = setInterval(check, pollMs);
-            const tm = setTimeout(() => {
-                clearInterval(iv);
-                resolve(lastSeen || "Таймаут: ответ не появился.");
-            }, timeoutMs);
-        });
-    }
-    """,
-        {
-            "prevText": prev_text,
-            "timeoutMs": timeout_ms,
-            "stableMs": STABLE_MS,
-            "pollMs": POLL_MS,
-        },
-    )
+        # Берём последний пузырь
+        last_bubble = bubbles[-1]
+        text = last_bubble.text_content().strip()
 
+        # Пропускаем пустые пузыри или те, что равны предыдущему тексту
+        if not text or text == prev_text:
+            page.wait_for_timeout(POLL_MS)
+            continue
+
+        if text == last_seen:
+            # Текст стабилен, проверяем время стабильности
+            if stable_start_time is None:
+                stable_start_time = time.time()
+            elif (time.time() - stable_start_time) >= STABLE_MS / 1000:
+                # Текст стабилен нужное время
+                return text
+        else:
+            # Текст изменился, сбрасываем таймер стабильности
+            last_seen = text
+            stable_start_time = None
+
+        page.wait_for_timeout(POLL_MS)
+
+    # Таймаут вышел
+    return last_seen or "Таймаут: ответ не появился."
 
 def _get_last_bubble_text(page) -> str:
     """Текст последнего пузыря Алисы."""
-    js = """
-    () => {
-        const bubbles = document.querySelectorAll(".AliceTextBubbleAnimated");
-        return bubbles.length ? bubbles[bubbles.length - 1].innerText.trim() : "";
-    }
-    """
-    return page.evaluate(js) or ""
-
+    bubbles = page.query_selector_all(BUBBLE_SEL)
+    if bubbles:
+        return bubbles[-1].text_content().strip()
+    return ""
 
 class ChatSession:
     """Одна вкладка, один чат, история сохраняется."""
@@ -149,12 +128,10 @@ class ChatSession:
         except Exception as e:
             return f"Ошибка: {e}"
 
-
 def ask(text: str, headless: bool = True) -> str:
     """Один запрос (открывает и закрывает браузер)."""
     with ChatSession(headless=headless) as s:
         return s.send(text)
-
 
 if __name__ == "__main__":
     import sys
